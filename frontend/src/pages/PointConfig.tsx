@@ -4,14 +4,17 @@
  * 消费 Point、Section；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { useNavigate } from 'react-router-dom'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import { ROUTES } from '@/router'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { usePointChains } from '@/hooks/usePointChains'
 import { db, type ObservationRow } from '@/utils/db'
 import {
   EMPTY_POINT_DRAFT,
@@ -35,9 +38,11 @@ interface BulkDraft {
 
 export default function PointConfig() {
   const { message } = AntdApp.useApp()
+  const navigate = useNavigate()
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations)
+  const chains = usePointChains()
 
   const [pointForm] = Form.useForm<PointDraft>()
   const [bulkForm] = Form.useForm<BulkDraft>()
@@ -259,6 +264,27 @@ export default function PointConfig() {
       }
     },
     { title: '单位', dataIndex: 'unit', width: 80 },
+    {
+      title: '接替状态',
+      width: 150,
+      render: (_value, record) => {
+        if (chains.isRetired(record.id)) {
+          const successorId = chains.outgoing(record.id)?.successorId
+          const successor = successorId ? pointStore.points.find((point) => point.id === successorId) : undefined
+          return (
+            <Tooltip title="旧点保留原始观测，新预警不再挂该点">
+              <Tag>已停测 → {successor?.code ?? '新点'}</Tag>
+            </Tooltip>
+          )
+        }
+        const incoming = chains.incoming(record.id)
+        if (incoming) {
+          const head = pointStore.points.find((point) => point.id === chains.chainOf(record.id)?.headId)
+          return <Tag color="purple">接替自 {head?.code ?? incoming.predecessorId}</Tag>
+        }
+        return <Tag color="green">在测</Tag>
+      }
+    },
     { title: '安装日期', dataIndex: 'installDate', width: 120 },
     {
       title: '最新累计变化',
@@ -276,13 +302,29 @@ export default function PointConfig() {
     },
     {
       title: '操作',
-      width: 150,
+      width: 220,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="删除该测点将同时删除其观测记录与预警单" onConfirm={() => removePoint(record)}>
+          <Tooltip title="测点损坏撤换时建立接替，保留原始观测并连续累计">
+            <Button
+              type="link"
+              size="small"
+              disabled={chains.isRetired(record.id)}
+              onClick={() => {
+                pointStore.setSelectedIds([record.id])
+                navigate(ROUTES.successions)
+              }}
+            >
+              接替
+            </Button>
+          </Tooltip>
+          <Popconfirm
+            title="删除该测点将同时删除其观测、预警与相关接替关系"
+            onConfirm={() => removePoint(record)}
+          >
             <Button type="link" size="small" danger>
               删除
             </Button>
@@ -306,6 +348,7 @@ export default function PointConfig() {
           <Button disabled={Object.keys(pointStore.thresholdDraft).length === 0} onClick={commitAll}>
             提交阈值草稿（{Object.keys(pointStore.thresholdDraft).length}）
           </Button>
+          <Button onClick={() => navigate(ROUTES.successions)}>测点接替</Button>
           <Button type="primary" onClick={openCreate}>
             新增测点
           </Button>
@@ -349,7 +392,7 @@ export default function PointConfig() {
             compact
           />
         ) : (
-          <Table<Point> rowKey="id" size="small" bordered dataSource={rows} columns={columns} pagination={false} scroll={{ x: 1200 }} />
+          <Table<Point> rowKey="id" size="small" bordered dataSource={rows} columns={columns} pagination={false} scroll={{ x: 1380 }} />
         )}
       </div>
 

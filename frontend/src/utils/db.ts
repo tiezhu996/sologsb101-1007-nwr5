@@ -10,10 +10,11 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
+import type { Succession } from '@/types/succession'
 import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
 
 export const DB_NAME = 'gbtaildam'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbtaildam:db-version',
@@ -38,13 +39,14 @@ export interface BackupPayload {
   observations: Observation[]
   alarms: Alarm[]
   pools: Pool[]
+  successions: Succession[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type DamRow = Dam & Revisioned
 export type SectionRow = Section & Revisioned
@@ -52,6 +54,27 @@ export type PointRow = Point & Revisioned
 export type ObservationRow = Observation & Revisioned
 export type AlarmRow = Alarm & Revisioned
 export type PoolRow = Pool & Revisioned
+export type SuccessionRow = Succession & Revisioned
+
+/** 接替/撤下前的一致性检查点：写入失败或撤销误操作时可整段恢复 */
+export interface CheckpointRow {
+  id: string
+  /** 触发检查点的动作 */
+  action: 'apply-succession' | 'revoke-succession'
+  /** 可读说明，如「DB-01 → DB-01A（2024-06-20）」 */
+  label: string
+  status: 'pending' | 'restored'
+  snapshot: {
+    points: PointRow[]
+    observations: ObservationRow[]
+    alarms: AlarmRow[]
+    successions: SuccessionRow[]
+  }
+  createdAt: number
+}
+
+const BUSINESS_TABLES = ['dams', 'sections', 'points', 'observations', 'alarms', 'pools'] as const
+const CHECKPOINT_SCOPE = ['points', 'observations', 'alarms', 'successions'] as const
 
 class TailDamDatabase extends Dexie {
   dams!: Table<DamRow, string>
@@ -60,6 +83,8 @@ class TailDamDatabase extends Dexie {
   observations!: Table<ObservationRow, string>
   alarms!: Table<AlarmRow, string>
   pools!: Table<PoolRow, string>
+  successions!: Table<SuccessionRow, string>
+  checkpoints!: Table<CheckpointRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -74,6 +99,17 @@ class TailDamDatabase extends Dexie {
     })
 
     // v2：测点/预警补 damId 冗余列（按坝体筛选免联表）；全部表补 revision 行修订号
+    this.version(2).stores({
+      dams: 'id, name, damType, grade, updatedAt',
+      sections: 'id, damId, stakeNo, updatedAt',
+      points: 'id, sectionId, damId, code, type, updatedAt',
+      observations: 'id, pointId, date, observer, updatedAt',
+      alarms: 'id, pointId, damId, level, state, updatedAt',
+      pools: 'id, damId, date, updatedAt'
+    })
+
+    // v3：测点接替作为独立关系落表；checkpoints 保存写前快照供失败恢复。
+    // 旧数据无需逐行迁移——没有接替关系的旧点在链派生时自动成为单点链。
     this.version(DB_VERSION)
       .stores({
         dams: 'id, name, damType, grade, updatedAt',
@@ -81,11 +117,13 @@ class TailDamDatabase extends Dexie {
         points: 'id, sectionId, damId, code, type, updatedAt',
         observations: 'id, pointId, date, observer, updatedAt',
         alarms: 'id, pointId, damId, level, state, updatedAt',
-        pools: 'id, damId, date, updatedAt'
+        pools: 'id, damId, date, updatedAt',
+        successions: 'id, predecessorId, successorId, effectiveDate, updatedAt',
+        checkpoints: 'id, action, status, createdAt'
       })
       .upgrade(async (tx) => {
         // 迁移 1：为全部业务行补齐 revision
-        for (const name of ['dams', 'sections', 'points', 'observations', 'alarms', 'pools']) {
+        for (const name of BUSINESS_TABLES) {
           await tx
             .table(name)
             .toCollection()
@@ -94,7 +132,7 @@ class TailDamDatabase extends Dexie {
             })
         }
 
-        // 迁移 2：测点缺少 damId 时用所属断面回填
+        // 迁移 2（v2 口径保留）：测点缺少 damId 时用所属断面回填
         const sections = (await tx.table('sections').toArray()) as Array<{ id: string; damId: string }>
         const damOfSection = new Map(sections.map((section) => [section.id, section.damId]))
         await tx
@@ -109,7 +147,7 @@ class TailDamDatabase extends Dexie {
             }
           })
 
-        // 迁移 3：预警缺少 damId 时用测点回填；补齐 handler / measure 字段
+        // 迁移 3（v2 口径保留）：预警缺少 damId 时用测点回填；补齐 handler / measure 字段
         const points = (await tx.table('points').toArray()) as Array<{ id: string; damId: string }>
         const damOfPoint = new Map(points.map((point) => [point.id, point.damId]))
         await tx
@@ -122,6 +160,19 @@ class TailDamDatabase extends Dexie {
             if (typeof alarm.handler !== 'string') alarm.handler = ''
             if (typeof alarm.measure !== 'string') alarm.measure = ''
           })
+
+        // 迁移 4：旧库不存在 successions 表；全部旧测点按链派生自动补成单点链，
+        // 这里仅防御性清理指向缺失测点的悬挂接替（异常导入数据时）。
+        const pointIds = new Set((await tx.table('points').toArray()).map((row: { id: string }) => row.id))
+        const existing = (await tx.table('successions').toArray()) as Array<{
+          id: string
+          predecessorId: string
+          successorId: string
+        }>
+        const orphanIds = existing
+          .filter((row) => !pointIds.has(row.predecessorId) || !pointIds.has(row.successorId))
+          .map((row) => row.id)
+        if (orphanIds.length > 0) await tx.table('successions').bulkDelete(orphanIds)
       })
   }
 }
@@ -159,7 +210,9 @@ const SEED_POINTS: PointRow[] = [
   { id: 'pt-6', sectionId: 'sec-2', damId: 'dam-1', code: 'JR-02', type: '浸润线', initialValue: 13.1, threshold: 2, unit: 'm', installDate: '2021-04-06', createdAt: stamp(-377), updatedAt: stamp(-4), revision: ROW_REVISION },
   { id: 'pt-7', sectionId: 'sec-3', damId: 'dam-2', code: 'DB-03', type: '表面位移', initialValue: 0, threshold: 20, unit: 'mm', installDate: '2022-05-11', createdAt: stamp(-340), updatedAt: stamp(-1), revision: ROW_REVISION },
   { id: 'pt-8', sectionId: 'sec-3', damId: 'dam-2', code: 'CX-02', type: '测斜', initialValue: 0, threshold: 24, unit: 'mm', installDate: '2022-05-11', createdAt: stamp(-340), updatedAt: stamp(-1), revision: ROW_REVISION },
-  { id: 'pt-9', sectionId: 'sec-4', damId: 'dam-2', code: 'SY-02', type: '渗压', initialValue: 38.5, threshold: 6, unit: 'kPa', installDate: '2022-05-18', createdAt: stamp(-339), updatedAt: stamp(-1), revision: ROW_REVISION }
+  { id: 'pt-9', sectionId: 'sec-4', damId: 'dam-2', code: 'SY-02', type: '渗压', initialValue: 38.5, threshold: 6, unit: 'kPa', installDate: '2022-05-18', createdAt: stamp(-339), updatedAt: stamp(-1), revision: ROW_REVISION },
+  // pt-10：pt-1（DB-01）损坏后的接替新点，同断面同类型；初值已平移使接替日首读数继承旧点累计 27.4
+  { id: 'pt-10', sectionId: 'sec-1', damId: 'dam-1', code: 'DB-01A', type: '表面位移', initialValue: 1.2, threshold: 25, unit: 'mm', installDate: '2024-06-20', createdAt: stamp(-12), updatedAt: stamp(0), revision: ROW_REVISION }
 ]
 
 /** 播种用的观测原始行：[测点, 日期, 读数, 观测人] */
@@ -167,6 +220,9 @@ const SEED_OBSERVATION_ROWS: Array<[string, string, number, string]> = [
   ['pt-1', '2024-04-10', 8.2, '刘振国'],
   ['pt-1', '2024-05-10', 15.4, '刘振国'],
   ['pt-1', '2024-06-09', 27.4, '陈文'],
+  // pt-1 于 2024-06-20 损坏撤换，pt-10（DB-01A）按接替日首读数 28.6 继承旧点累计 27.4
+  ['pt-10', '2024-06-20', 28.6, '刘振国'],
+  ['pt-10', '2024-07-10', 29.8, '刘振国'],
   ['pt-2', '2024-04-10', 9.6, '刘振国'],
   ['pt-2', '2024-05-10', 16.2, '陈文'],
   ['pt-2', '2024-06-09', 27.9, '陈文'],
@@ -204,6 +260,25 @@ const SEED_POOLS: PoolRow[] = [
   { id: 'pl-5', damId: 'dam-2', date: '2024-06-09', waterLevelM: 643.4, beachLengthM: 74, freeboardM: 1.8, createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
 ]
 
+/** 播种接替：pt-1（DB-01）→ pt-10（DB-01A），旧点 2024-06-09 末次累计 27.4 由新点首读数继承 */
+const SEED_SUCCESSIONS: SuccessionRow[] = [
+  {
+    id: 'sc-1',
+    predecessorId: 'pt-1',
+    successorId: 'pt-10',
+    effectiveDate: '2024-06-20',
+    firstReading: 28.6,
+    inheritedCumulative: 27.4,
+    predecessorLastDate: '2024-06-09',
+    originalInitialValue: 0,
+    successorObservationCount: 0,
+    remark: '表面位移测点 DB-01 测杆损坏，原位更换为 DB-01A',
+    createdAt: stamp(-12),
+    updatedAt: stamp(-12),
+    revision: ROW_REVISION
+  }
+]
+
 /** 由原始行派生累计变化量与日速率 */
 function buildSeedObservations(): ObservationRow[] {
   const previousByPoint = new Map<string, { date: string; reading: number }>()
@@ -229,14 +304,19 @@ function buildSeedObservations(): ObservationRow[] {
 }
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await db.dams.bulkPut(SEED_DAMS)
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.points.bulkPut(SEED_POINTS)
-    await db.observations.bulkPut(buildSeedObservations())
-    await db.alarms.bulkPut(SEED_ALARMS)
-    await db.pools.bulkPut(SEED_POOLS)
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.successions, db.checkpoints],
+    async () => {
+      await db.dams.bulkPut(SEED_DAMS)
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.points.bulkPut(SEED_POINTS)
+      await db.observations.bulkPut(buildSeedObservations())
+      await db.alarms.bulkPut(SEED_ALARMS)
+      await db.pools.bulkPut(SEED_POOLS)
+      await db.successions.bulkPut(SEED_SUCCESSIONS)
+    }
+  )
 }
 
 /** 首屏调用：打开数据库并在主表为空时播种演示数据 */
@@ -250,28 +330,48 @@ export async function initDatabase(): Promise<void> {
 /* ============================== 级联删除 ============================== */
 
 export async function deleteDamCascade(damId: string): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    const sections = await db.sections.where('damId').equals(damId).toArray()
-    await deletePointsOfSections(sections.map((section) => section.id))
-    if (sections.length > 0) await db.sections.bulkDelete(sections.map((section) => section.id))
-    await db.pools.where('damId').equals(damId).delete()
-    await db.dams.delete(damId)
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.successions, db.checkpoints],
+    async () => {
+      const sections = await db.sections.where('damId').equals(damId).toArray()
+      await deletePointsOfSections(sections.map((section) => section.id))
+      if (sections.length > 0) await db.sections.bulkDelete(sections.map((section) => section.id))
+      await db.pools.where('damId').equals(damId).delete()
+      await db.dams.delete(damId)
+    }
+  )
 }
 
 export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.points, db.observations, db.alarms, async () => {
-    await deletePointsOfSections([sectionId])
-    await db.sections.delete(sectionId)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.points, db.observations, db.alarms, db.successions, db.checkpoints],
+    async () => {
+      await deletePointsOfSections([sectionId])
+      await db.sections.delete(sectionId)
+    }
+  )
 }
 
 export async function deletePointCascade(pointId: string): Promise<void> {
-  await db.transaction('rw', db.points, db.observations, db.alarms, async () => {
-    await db.observations.where('pointId').equals(pointId).delete()
-    await db.alarms.where('pointId').equals(pointId).delete()
-    await db.points.delete(pointId)
-  })
+  await db.transaction(
+    'rw',
+    [db.points, db.observations, db.alarms, db.successions, db.checkpoints],
+    async () => {
+      // 测点删除时相关接替关系一并消失；剩余两侧之一不存在的悬挂关系同步清理
+      const linked = await db.successions
+        .where('predecessorId')
+        .equals(pointId)
+        .or('successorId')
+        .equals(pointId)
+        .primaryKeys()
+      if (linked.length > 0) await db.successions.bulkDelete(linked)
+      await db.observations.where('pointId').equals(pointId).delete()
+      await db.alarms.where('pointId').equals(pointId).delete()
+      await db.points.delete(pointId)
+    }
+  )
 }
 
 async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
@@ -279,6 +379,13 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
   const points = await db.points.where('sectionId').anyOf(sectionIds).toArray()
   const pointIds = points.map((point) => point.id)
   if (pointIds.length > 0) {
+    const linkedKeys = await db.successions
+      .where('predecessorId')
+      .anyOf(pointIds)
+      .or('successorId')
+      .anyOf(pointIds)
+      .primaryKeys()
+    if (linkedKeys.length > 0) await db.successions.bulkDelete(linkedKeys)
     await db.observations.where('pointId').anyOf(pointIds).delete()
     await db.alarms.where('pointId').anyOf(pointIds).delete()
     await db.points.bulkDelete(pointIds)
@@ -288,25 +395,27 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, successions] = await Promise.all([
     db.dams.count(),
     db.sections.count(),
     db.points.count(),
     db.observations.count(),
     db.alarms.count(),
-    db.pools.count()
+    db.pools.count(),
+    db.successions.count()
   ])
-  return { dams, sections, points, observations, alarms, pools }
+  return { dams, sections, points, observations, alarms, pools, successions }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, successions] = await Promise.all([
     db.dams.toArray(),
     db.sections.toArray(),
     db.points.toArray(),
     db.observations.toArray(),
     db.alarms.toArray(),
-    db.pools.toArray()
+    db.pools.toArray(),
+    db.successions.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -321,41 +430,56 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     observations: observations.map(strip),
     alarms: alarms.map(strip),
-    pools: pools.map(strip)
+    pools: pools.map(strip),
+    successions: successions.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.dams.bulkPut((payload.dams ?? []).map(rev))
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.points.bulkPut((payload.points ?? []).map(rev))
-    await db.observations.bulkPut((payload.observations ?? []).map(rev))
-    await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
-    await db.pools.bulkPut((payload.pools ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.successions, db.checkpoints],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.successions.clear(),
+        // 检查点属于本机运行态：整库导入后旧快照不得再覆盖新数据
+        db.checkpoints.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.dams.bulkPut((payload.dams ?? []).map(rev))
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.points.bulkPut((payload.points ?? []).map(rev))
+      await db.observations.bulkPut((payload.observations ?? []).map(rev))
+      await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
+      await db.pools.bulkPut((payload.pools ?? []).map(rev))
+      await db.successions.bulkPut((payload.successions ?? []).map(rev))
+    }
+  )
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.successions, db.checkpoints],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.successions.clear(),
+        db.checkpoints.clear()
+      ])
+    }
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -399,6 +523,151 @@ export async function recalculateObservations(pointId: string): Promise<void> {
       cumulative: cumulativeOf(row.reading, initialValue),
       dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
       updatedAt: Date.now()
+    }
+  })
+  if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/* ============================ 接替关系与检查点 ============================ */
+
+/** 建立接替入参（store 层完成校验与影响预览后调用） */
+export interface ApplySuccessionInput {
+  predecessorId: string
+  successorId: string
+  effectiveDate: string
+  firstReading: number
+  inheritedCumulative: number
+  predecessorLastDate: string
+  originalInitialValue: number
+  successorObservationCount: number
+  remark: string
+}
+
+async function snapshotCheckpointScope(): Promise<CheckpointRow['snapshot']> {
+  const [points, observations, alarms, successions] = await Promise.all([
+    db.points.toArray(),
+    db.observations.toArray(),
+    db.alarms.toArray(),
+    db.successions.toArray()
+  ])
+  return { points, observations, alarms, successions }
+}
+
+/**
+ * 写前检查点：接替/撤下生效前留存受影响表的完整快照。
+ * 之后写库若失败，页面可凭该检查点一键恢复；写库成功后调用方负责删除。
+ */
+export async function createCheckpoint(
+  action: CheckpointRow['action'],
+  label: string
+): Promise<CheckpointRow> {
+  const snapshot = await snapshotCheckpointScope()
+  const row: CheckpointRow = {
+    id: createId('ck'),
+    action,
+    label,
+    status: 'pending',
+    snapshot,
+    createdAt: Date.now()
+  }
+  await db.checkpoints.put(row)
+  return row
+}
+
+export async function deleteCheckpoint(id: string): Promise<void> {
+  await db.checkpoints.delete(id)
+}
+
+/** 从检查点恢复：把四点表整体还原回快照时刻（已闭环处置记录也按快照还原） */
+export async function restoreCheckpoint(id: string): Promise<void> {
+  const checkpoint = await db.checkpoints.get(id)
+  if (!checkpoint) throw new Error('检查点不存在或已被删除')
+  await db.transaction(
+    'rw',
+    [...CHECKPOINT_SCOPE.map((name) => db[name]), db.checkpoints],
+    async () => {
+      await Promise.all([
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.successions.clear()
+      ])
+      await db.points.bulkPut(checkpoint.snapshot.points)
+      await db.observations.bulkPut(checkpoint.snapshot.observations)
+      await db.alarms.bulkPut(checkpoint.snapshot.alarms)
+      await db.successions.bulkPut(checkpoint.snapshot.successions)
+      await db.checkpoints.update(id, { status: 'restored' })
+    }
+  )
+}
+
+/**
+ * 接替生效（独立事务）：
+ * 旧点原始观测与旧预警原样保留；新点初值平移使首读数连续累计 = 继承基线；
+ * 新点已存在的观测按平移后初值重算。旧预警不自动改挂，新预警仍按新点归属。
+ */
+export async function applySuccession(input: ApplySuccessionInput): Promise<SuccessionRow> {
+  const now = Date.now()
+  const shiftedInitialValue = cumulativeOf(input.firstReading, input.inheritedCumulative)
+  let row: SuccessionRow | null = null
+  await db.transaction('rw', [db.points, db.observations, db.successions], async () => {
+    const successor = await db.points.get(input.successorId)
+    if (!successor) throw new Error('新测点不存在')
+    row = {
+      id: createId('sc'),
+      predecessorId: input.predecessorId,
+      successorId: input.successorId,
+      effectiveDate: input.effectiveDate,
+      firstReading: input.firstReading,
+      inheritedCumulative: input.inheritedCumulative,
+      predecessorLastDate: input.predecessorLastDate,
+      originalInitialValue: input.originalInitialValue,
+      successorObservationCount: input.successorObservationCount,
+      remark: input.remark.trim(),
+      createdAt: now,
+      updatedAt: now,
+      revision: ROW_REVISION
+    }
+    await db.successions.put(row)
+    await db.points.update(input.successorId, { initialValue: shiftedInitialValue, updatedAt: now })
+    await recalculateObservationsInTx(input.successorId, shiftedInitialValue, now)
+  })
+  if (!row) throw new Error('接替关系写入失败')
+  return row
+}
+
+/**
+ * 撤下接替关系（独立事务）：
+ * 删除关系、新点初值恢复原值并按单点口径重算；
+ * 已闭环处置记录照旧保留（本就不被改动），旧点原始观测也从未改动。
+ * 调用方须先确认新点没有未闭环预警——有则拒绝撤下（新预警归属不能回退）。
+ */
+export async function revokeSuccession(successionId: string): Promise<void> {
+  const now = Date.now()
+  await db.transaction('rw', [db.points, db.observations, db.successions], async () => {
+    const succession = await db.successions.get(successionId)
+    if (!succession) throw new Error('接替关系不存在或已被撤下')
+    await db.points.update(succession.successorId, {
+      initialValue: succession.originalInitialValue,
+      updatedAt: now
+    })
+    await recalculateObservationsInTx(succession.successorId, succession.originalInitialValue, now)
+    await db.successions.delete(successionId)
+  })
+}
+
+/** 事务内重算某测点观测（避免嵌套开启事务） */
+async function recalculateObservationsInTx(pointId: string, initialValue: number, now: number): Promise<void> {
+  const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
+    a.date.localeCompare(b.date)
+  )
+  const patches = rows.map((item, index) => {
+    const previous = index === 0 ? null : rows[index - 1]
+    return {
+      ...item,
+      cumulative: cumulativeOf(item.reading, initialValue),
+      dailyRate: previous ? dailyRateOf(item.reading, previous.reading, daysBetween(previous.date, item.date)) : 0,
+      updatedAt: now
     }
   })
   if (patches.length > 0) await db.observations.bulkPut(patches)

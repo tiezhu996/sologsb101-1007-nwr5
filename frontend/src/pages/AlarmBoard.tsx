@@ -4,7 +4,7 @@
  * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -13,8 +13,7 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
-import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type ObservationRow } from '@/utils/db'
+import { usePointChains } from '@/hooks/usePointChains'
 import {
   ALARM_LEVELS,
   ALARM_STATE_FLOW,
@@ -31,7 +30,7 @@ export default function AlarmBoard() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
-  const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
+  const chains = usePointChains()
 
   const [form] = Form.useForm<AlarmDraft>()
   const [open, setOpen] = useState(false)
@@ -74,8 +73,14 @@ export default function AlarmBoard() {
     const text = keyword.trim().toLowerCase()
     if (text.length === 0) return true
     const point = pointStore.points.find((item) => item.id === alarm.pointId)
+    // 沿接续链：用链上任一测点编号（含接替后新点）都能检索到该预警链相关记录
+    const chain = chains.chainOf(alarm.pointId)
+    const chainCodes = chain
+      ? chain.pointIds.map((id) => pointStore.points.find((item) => item.id === id)?.code.toLowerCase() ?? '').join(' ')
+      : ''
     return (
       (point ? point.code.toLowerCase().includes(text) : false) ||
+      chainCodes.includes(text) ||
       alarm.handler.toLowerCase().includes(text) ||
       alarm.measure.toLowerCase().includes(text)
     )
@@ -85,12 +90,13 @@ export default function AlarmBoard() {
   const levelCounts = alarmStore.levelCounts()
 
   const openCreate = (): void => {
+    const activePoints = pointStore.points.filter((point) => !chains.isRetired(point.id))
     if (pointStore.points.length === 0) {
       message.warning('请先布设测点')
       return
     }
     setEditingId(null)
-    form.setFieldsValue({ ...EMPTY_ALARM_DRAFT, pointId: pointStore.points[0].id })
+    form.setFieldsValue({ ...EMPTY_ALARM_DRAFT, pointId: activePoints[0]?.id ?? pointStore.points[0].id })
     setOpen(true)
   }
 
@@ -151,19 +157,43 @@ export default function AlarmBoard() {
     setCloseTarget(null)
   }
 
-  const pointOptions = pointStore.points.map((point) => {
-    const dam = damStore.dams.find((item) => item.id === point.damId)
-    return { label: `${point.code} · ${point.type} · ${dam ? dam.name : '未知坝体'}`, value: point.id }
-  })
+  // 新预警只能挂当前在测（链尾）测点；已停测旧点不出现在新建选项中
+  const pointOptions = pointStore.points
+    .filter((point) => !chains.isRetired(point.id))
+    .map((point) => {
+      const dam = damStore.dams.find((item) => item.id === point.damId)
+      const incoming = chains.incoming(point.id)
+      const headCode = incoming ? pointStore.points.find((item) => item.id === chains.chainOf(point.id)?.headId)?.code : undefined
+      return {
+        label: `${point.code} · ${point.type} · ${dam ? dam.name : '未知坝体'}${headCode ? `（接替自 ${headCode}）` : ''}`,
+        value: point.id
+      }
+    })
 
   const columns: TableColumnsType<Alarm> = [
     {
       title: '坝体 / 测点',
-      width: 200,
+      width: 240,
       render: (_value, record) => {
         const point = pointStore.points.find((item) => item.id === record.pointId)
         const dam = damStore.dams.find((item) => item.id === record.damId)
-        return `${dam ? dam.name : '—'} / ${point ? point.code : '测点已删除'}`
+        const retired = chains.isRetired(record.pointId)
+        const incoming = chains.incoming(record.pointId)
+        const headCode = incoming
+          ? pointStore.points.find((item) => item.id === chains.chainOf(record.pointId)?.headId)?.code
+          : undefined
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{dam ? dam.name : '—'} / {point ? point.code : '测点已删除'}</span>
+            {retired ? (
+              <Tooltip title="旧预警不随接替自动改挂，仍归属旧测点；处置闭环照旧">
+                <Tag style={{ width: 'fit-content' }}>旧点预警 · 未改挂</Tag>
+              </Tooltip>
+            ) : incoming && headCode ? (
+              <Tag color="purple" style={{ width: 'fit-content' }}>接替新点（链自 {headCode}）</Tag>
+            ) : null}
+          </Space>
+        )
       }
     },
     { title: '级别', width: 150, render: (_value, record) => <AlarmTag level={record.level} size="small" /> },
@@ -180,10 +210,11 @@ export default function AlarmBoard() {
       title: '触发读数',
       width: 130,
       render: (_value, record) => {
-        const observation = observationTable.rows.find(
-          (row) => row.pointId === record.pointId && row.date === record.triggerDate
+        const chain = chains.chainOf(record.pointId)
+        const hit = chain?.observations.find(
+          (item) => item.pointId === record.pointId && item.observation.date === record.triggerDate
         )
-        return observation ? observation.reading.toFixed(3) : <span className="muted">—</span>
+        return hit ? hit.observation.reading.toFixed(3) : <span className="muted">—</span>
       }
     },
     {
