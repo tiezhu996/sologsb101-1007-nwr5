@@ -4,7 +4,13 @@
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, deletePointCascade, type PointRow } from '@/utils/db'
+import {
+  createId,
+  db,
+  deletePointCascade,
+  recalculateObservations,
+  type PointRow
+} from '@/utils/db'
 import {
   createEmptyPointFilter,
   POINT_UNIT,
@@ -82,6 +88,8 @@ export const usePointStore = create<PointState>((set, get) => ({
       if (section) next.damId = section.damId
     }
     await db.points.update(id, next)
+    // 初值变更影响全部累计量；接替链上的新点按连续口径重算
+    if (patch.initialValue !== undefined) await recalculateObservations(id)
   },
 
   async removePoint(id) {
@@ -128,12 +136,14 @@ export const usePointStore = create<PointState>((set, get) => ({
   async commitThresholdDraft(pointId) {
     const draft = get().thresholdDraft[pointId]
     if (!draft) return
+    const point = get().points.find((item) => item.id === pointId)
     await db.points.update(pointId, {
       initialValue: draft.initialValue,
       threshold: draft.threshold > 0 ? draft.threshold : 1,
       updatedAt: Date.now()
     })
     get().clearThresholdDraft(pointId)
+    if (!point || point.initialValue !== draft.initialValue) await recalculateObservations(pointId)
   },
 
   async commitAllThresholdDrafts() {
@@ -150,7 +160,14 @@ export const usePointStore = create<PointState>((set, get) => ({
           updatedAt: Date.now()
         }
       })
-    if (rows.length > 0) await db.points.bulkPut(rows)
+    if (rows.length > 0) {
+      await db.points.bulkPut(rows)
+      // 初值有变化的测点逐个重算（新点在接替链上按连续口径重算）
+      for (const row of rows) {
+        const original = get().points.find((point) => point.id === row.id)
+        if (original && original.initialValue !== row.initialValue) await recalculateObservations(row.id)
+      }
+    }
     get().clearThresholdDraft()
     return rows.length
   },

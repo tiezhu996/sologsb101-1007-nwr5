@@ -7,6 +7,7 @@ import { ROUTES } from './router'
 import { useDamStore } from './stores/damStore'
 import { usePointStore } from './stores/pointStore'
 import { useAlarmStore } from './stores/alarmStore'
+import { useSuccessionStore } from './stores/successionStore'
 import { useIdbTable } from './hooks/useIdbTable'
 import { db, type ObservationRow } from './utils/db'
 
@@ -18,14 +19,17 @@ export default function App() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const successionStore = useSuccessionStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const currentDam = damStore.currentDam()
   const openAlarms = alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环').length
+  const activeSuccessions = successionStore.successions.filter((link) => link.status === '生效').length
 
   const navItems = [
     { path: ROUTES.dams, label: '坝体台账', count: damStore.dams.length },
     { path: ROUTES.points, label: '测点配置', count: pointStore.points.length },
+    { path: ROUTES.successions, label: '测点接替', count: activeSuccessions },
     { path: ROUTES.observations, label: '观测录入', count: observationTable.rows.length },
     { path: ROUTES.trends, label: '速率计算', count: pointStore.points.length },
     { path: ROUTES.alarms, label: '预警处置', count: openAlarms },

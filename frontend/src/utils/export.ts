@@ -7,7 +7,9 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
+import type { Succession } from '@/types/succession'
 import { checkPool, MIN_BEACH_LENGTH_M, MIN_FREEBOARD_M } from '@/types/pool'
+import { buildChainIndex, chainCodeOf, chainHeadOf } from '@/utils/succession'
 import { ratioOf } from '@/utils/threshold'
 
 export function download(filename: string, content: string, mime: string): void {
@@ -39,19 +41,22 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 观测台账 CSV */
+/** 观测台账 CSV（沿接续链给出连续累计口径与链编号） */
 export function exportObservationCsv(
   dams: Dam[],
   sections: Section[],
   points: Point[],
-  observations: Observation[]
+  observations: Observation[],
+  successions: Succession[] = []
 ): string {
+  const index = buildChainIndex(successions)
   const header = [
     '坝体',
     '坝型',
     '等别',
     '桩号',
-    '测点编号',
+    '接续链',
+    '归属测点',
     '测点类型',
     '初值',
     '阈值',
@@ -68,12 +73,14 @@ export function exportObservationCsv(
     const point = points.find((item) => item.id === observation.pointId)
     const section = point ? sections.find((item) => item.id === point.sectionId) : undefined
     const dam = section ? dams.find((item) => item.id === section.damId) : undefined
+    const chainCode = point ? chainCodeOf(chainHeadOf(point.id, index), index, points) : '—'
     lines.push(
       [
         dam ? dam.name : '—',
         dam ? dam.damType : '—',
         dam ? dam.grade : '—',
         section ? section.stakeNo : '—',
+        chainCode,
         point ? point.code : '—',
         point ? point.type : '—',
         point ? point.initialValue : '—',
@@ -95,16 +102,19 @@ export function exportObservationCsv(
   return filename
 }
 
-/** 预警与闭环台账 CSV */
-export function exportAlarmCsv(dams: Dam[], points: Point[], alarms: Alarm[]): string {
-  const header = ['坝体', '测点编号', '测点类型', '级别', '触发值', '触发日期', '状态', '处置人', '处置措施']
+/** 预警与闭环台账 CSV（含接续链编号，预警归属测点保持不变） */
+export function exportAlarmCsv(dams: Dam[], points: Point[], alarms: Alarm[], successions: Succession[] = []): string {
+  const index = buildChainIndex(successions)
+  const header = ['坝体', '接续链', '归属测点', '测点类型', '级别', '触发值', '触发日期', '状态', '处置人', '处置措施']
   const lines: string[] = [header.map(csvCell).join(',')]
   alarms.forEach((alarm) => {
     const point = points.find((item) => item.id === alarm.pointId)
     const dam = dams.find((item) => item.id === alarm.damId)
+    const chainCode = point ? chainCodeOf(chainHeadOf(point.id, index), index, points) : '—'
     lines.push(
       [
         dam ? dam.name : '—',
+        chainCode,
         point ? point.code : '—',
         point ? point.type : '—',
         alarm.level,

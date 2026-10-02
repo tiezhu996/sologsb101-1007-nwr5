@@ -32,17 +32,22 @@ export interface AlarmDraftResult {
 }
 
 export interface UseAlarmLevelResult {
-  evaluate: (point: Point, reading: number) => AlarmEvaluation
+  /**
+   * @param effectiveInitial 连续口径初值：接替后的新点传入已扣减继承量的初值；
+   * 缺省用测点自身初值。
+   */
+  evaluate: (point: Point, reading: number, effectiveInitial?: number) => AlarmEvaluation
   /** 越限时返回预警草稿与依据，未越限返回 null */
-  buildDraft: (point: Point, date: string, reading: number) => AlarmDraftResult | null
+  buildDraft: (point: Point, date: string, reading: number, effectiveInitial?: number) => AlarmDraftResult | null
   colorOf: (level: AlarmLevel) => string
   bgOf: (level: AlarmLevel) => string
   levelOptions: AlarmLevel[]
 }
 
 export function useAlarmLevel(): UseAlarmLevelResult {
-  const evaluate = useCallback((point: Point, reading: number): AlarmEvaluation => {
-    const cumulative = cumulativeOf(reading, point.initialValue)
+  const evaluate = useCallback((point: Point, reading: number, effectiveInitial?: number): AlarmEvaluation => {
+    const initial = Number.isFinite(effectiveInitial) ? (effectiveInitial as number) : point.initialValue
+    const cumulative = cumulativeOf(reading, initial)
     const ratio = ratioOf(cumulative, point.threshold)
     const level = alarmLevelOf(cumulative, point.threshold)
     return {
@@ -55,8 +60,8 @@ export function useAlarmLevel(): UseAlarmLevelResult {
   }, [])
 
   const buildDraft = useCallback(
-    (point: Point, date: string, reading: number): AlarmDraftResult | null => {
-      const evaluation = evaluate(point, reading)
+    (point: Point, date: string, reading: number, effectiveInitial?: number): AlarmDraftResult | null => {
+      const evaluation = evaluate(point, reading, effectiveInitial)
       if (evaluation.level === null) return null
       return {
         draft: {

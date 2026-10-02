@@ -4,7 +4,7 @@
  * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { usePointChains } from '@/hooks/usePointChain'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import {
@@ -31,6 +32,7 @@ export default function AlarmBoard() {
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
+  const chains = usePointChains()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const [form] = Form.useForm<AlarmDraft>()
@@ -74,8 +76,10 @@ export default function AlarmBoard() {
     const text = keyword.trim().toLowerCase()
     if (text.length === 0) return true
     const point = pointStore.points.find((item) => item.id === alarm.pointId)
+    const chainText = point ? chains.codeOf(chains.headOf(point.id)).toLowerCase() : ''
     return (
       (point ? point.code.toLowerCase().includes(text) : false) ||
+      chainText.includes(text) ||
       alarm.handler.toLowerCase().includes(text) ||
       alarm.measure.toLowerCase().includes(text)
     )
@@ -158,12 +162,27 @@ export default function AlarmBoard() {
 
   const columns: TableColumnsType<Alarm> = [
     {
-      title: '坝体 / 测点',
-      width: 200,
+      title: '归属测点（接续链）',
+      width: 240,
       render: (_value, record) => {
         const point = pointStore.points.find((item) => item.id === record.pointId)
         const dam = damStore.dams.find((item) => item.id === record.damId)
-        return `${dam ? dam.name : '—'} / ${point ? point.code : '测点已删除'}`
+        if (!point) return `${dam ? dam.name : '—'} / 测点已删除`
+        const chainPoints = chains.pointsOf(chains.headOf(point.id))
+        const inChain = chainPoints.length > 1
+        const isInherited = Boolean(chains.incomingLink(point.id))
+        return (
+          <Space size={4} wrap>
+            <span>{dam ? dam.name : '—'}</span>
+            <strong>{point.code}</strong>
+            {inChain ? <Tag color={isInherited ? 'blue' : 'default'}>{isInherited ? '接替新点' : '链首旧点'}</Tag> : null}
+            {inChain ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {chains.codeOf(chains.headOf(point.id))}
+              </Typography.Text>
+            ) : null}
+          </Space>
+        )
       }
     },
     { title: '级别', width: 150, render: (_value, record) => <AlarmTag level={record.level} size="small" /> },
@@ -224,7 +243,7 @@ export default function AlarmBoard() {
         <div>
           <h2 className="page-head__title">预警触发与处置闭环</h2>
           <p className="page-head__desc">
-            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档。
+            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置；预警归属不随测点接替改挂——旧点预警留在旧点，接替后新预警归属新测点，已闭环处置记录照旧。
           </p>
         </div>
         <div className="page-head__actions">

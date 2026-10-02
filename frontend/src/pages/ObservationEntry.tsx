@@ -4,7 +4,7 @@
  * 消费 Observation、Point；复用 <FilterBar>、<AlarmTag>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Table, Tag } from 'antd'
+import { Alert, App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Table, Tag } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -14,6 +14,7 @@ import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
+import { usePointChains } from '@/hooks/usePointChain'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, putObservation, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
@@ -25,6 +26,7 @@ export default function ObservationEntry() {
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
   const alarmLevel = useAlarmLevel()
+  const chains = usePointChains()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const [form] = Form.useForm<ObservationDraft>()
@@ -78,8 +80,12 @@ export default function ObservationEntry() {
   const draftDate = Form.useWatch('date', form)
   const preview =
     activePoint && typeof draftReading === 'number'
-      ? alarmLevel.evaluate(activePoint, draftReading)
+      ? alarmLevel.evaluate(activePoint, draftReading, chains.initialValueOf(activePoint.id))
       : null
+
+  /** 新点作为接替点且尚未首读继承时的提示 */
+  const activeIncoming = activePoint ? chains.incomingLink(activePoint.id) : null
+  const awaitingFirstReading = Boolean(activeIncoming && !activeIncoming.inherited)
 
   const openCreate = (): void => {
     if (!activePoint) {
@@ -154,10 +160,15 @@ export default function ObservationEntry() {
       message.info('当前读数未越限，无需生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(activePoint, draftDate || new Date().toISOString().slice(0, 10), Number(draftReading))
+    const result = alarmLevel.buildDraft(
+      activePoint,
+      draftDate || new Date().toISOString().slice(0, 10),
+      Number(draftReading),
+      chains.initialValueOf(activePoint.id)
+    )
     if (!result) return
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
-    message.success(`已生成${result.draft.level}色预警单`)
+    message.success(`已生成${result.draft.level}色预警单，归属测点 ${activePoint.code}`)
   }
 
   const columns: TableColumnsType<ObservationRow> = [
@@ -176,7 +187,7 @@ export default function ObservationEntry() {
       render: (_value, record) => {
         const point = pointStore.points.find((item) => item.id === record.pointId)
         if (!point) return <span className="muted">测点已删除</span>
-        const level = alarmLevel.evaluate(point, record.reading).level
+        const level = alarmLevel.evaluate(point, record.reading, chains.initialValueOf(point.id)).level
         return level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
       }
     },
@@ -240,7 +251,9 @@ export default function ObservationEntry() {
               const latest = observationTable.rows
                 .filter((row) => row.pointId === point.id)
                 .sort((a, b) => b.date.localeCompare(a.date))[0]
-              const level = latest ? alarmLevel.evaluate(point, latest.reading).level : null
+              const level = latest ? alarmLevel.evaluate(point, latest.reading, chains.initialValueOf(point.id)).level : null
+              const incoming = chains.incomingLink(point.id)
+              const predecessor = incoming ? pointStore.points.find((item) => item.id === incoming.predecessorId) : null
               return (
                 <div
                   key={point.id}
@@ -249,6 +262,7 @@ export default function ObservationEntry() {
                 >
                   <div className="card-list-item__head">
                     <span>{point.code}</span>
+                    {incoming ? <Tag color="blue">接替 {predecessor ? predecessor.code : ''}</Tag> : null}
                     {level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>}
                   </div>
                   <div className="card-list-item__meta">
@@ -259,6 +273,15 @@ export default function ObservationEntry() {
                   <div className="card-list-item__meta">
                     <span>最新：{latest ? `${latest.date} ${latest.reading.toFixed(3)} ${point.unit}` : '暂无观测'}</span>
                   </div>
+                  {incoming ? (
+                    <div className="card-list-item__meta">
+                      <Tag color={incoming.inherited ? 'geekblue' : 'gold'} style={{ marginInlineEnd: 0 }}>
+                        {incoming.inherited
+                          ? `自 ${incoming.effectiveDate} 接替 ${predecessor ? predecessor.code : ''}，累计连续`
+                          : `待首读继承（≥ ${incoming.effectiveDate} 录入首条读数）`}
+                      </Tag>
+                    </div>
+                  ) : null}
                 </div>
               )
             })
@@ -273,14 +296,29 @@ export default function ObservationEntry() {
                   {activePoint.code} · 观测明细
                   <span className="muted">
                     {' '}
-                    {activePoint.type} · 初值 {activePoint.initialValue} {activePoint.unit} · 阈值 {activePoint.threshold}{' '}
-                    {activePoint.unit}
+                    {activePoint.type} · 连续口径初值 {chains.initialValueOf(activePoint.id)} {activePoint.unit} · 阈值{' '}
+                    {activePoint.threshold} {activePoint.unit}
                   </span>
                 </h3>
                 <Button size="small" type="primary" onClick={openCreate}>
                   录入观测
                 </Button>
               </div>
+              {awaitingFirstReading ? (
+                <Alert
+                  style={{ marginBottom: 12 }}
+                  type="warning"
+                  showIcon
+                  message={`该测点自 ${activeIncoming?.effectiveDate ?? ''} 起接替，首条 ≥ 接替日读数将自动继承旧点累计值并完成接档`}
+                />
+              ) : activeIncoming ? (
+                <Alert
+                  style={{ marginBottom: 12 }}
+                  type="info"
+                  showIcon
+                  message={`已按接替关系接续，累计位移与日速率沿链连续；本测点新触发的预警归属本测点，旧点预警不改挂`}
+                />
+              ) : null}
               {observationsOfActive.length === 0 ? (
                 <EmptyPanel
                   title="该测点暂无观测记录"

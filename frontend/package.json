@@ -8,6 +8,7 @@
     "dev": "vite --host --port 22807",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:succession": "tsx src/test/succession.test.ts",
     "preview": "vite preview --host --port 22807"
   },
   "dependencies": {
@@ -25,6 +26,8 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
+    "tsx": "^4.23.15",
     "typescript": "~5.7.3",
     "vite": "^6.1.0"
   }

@@ -1,5 +1,5 @@
 /**
- * 路由表：/dams、/points、/observations、/trends、/alarms、/pool
+ * 路由表：/dams、/points、/successions、/observations、/trends、/alarms、/pool
  * 页面按路由懒加载，构建时自动分包。
  */
 import { Suspense, lazy, type ReactNode } from 'react'
@@ -9,6 +9,7 @@ import App from '../App'
 
 const DamList = lazy(() => import('../pages/DamList'))
 const PointConfig = lazy(() => import('../pages/PointConfig'))
+const SuccessionBoard = lazy(() => import('../pages/SuccessionBoard'))
 const ObservationEntry = lazy(() => import('../pages/ObservationEntry'))
 const TrendBoard = lazy(() => import('../pages/TrendBoard'))
 const AlarmBoard = lazy(() => import('../pages/AlarmBoard'))
@@ -17,6 +18,7 @@ const PoolLog = lazy(() => import('../pages/PoolLog'))
 export const ROUTES = {
   dams: '/dams',
   points: '/points',
+  successions: '/successions',
   observations: '/observations',
   trends: '/trends',
   alarms: '/alarms',
@@ -39,6 +41,7 @@ export const appRoutes: RouteObject[] = [
       { index: true, element: <Navigate to={ROUTES.dams} replace /> },
       { path: 'dams', element: withSuspense(<DamList />) },
       { path: 'points', element: withSuspense(<PointConfig />) },
+      { path: 'successions', element: withSuspense(<SuccessionBoard />) },
       { path: 'observations', element: withSuspense(<ObservationEntry />) },
       { path: 'trends', element: withSuspense(<TrendBoard />) },
       { path: 'alarms', element: withSuspense(<AlarmBoard />) },

@@ -4,6 +4,7 @@
  * 消费 Point、Section；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
 import type { TableColumnsType } from 'antd'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -11,6 +12,7 @@ import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
+import { usePointChains } from '@/hooks/usePointChain'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import {
@@ -35,8 +37,10 @@ interface BulkDraft {
 
 export default function PointConfig() {
   const { message } = AntdApp.useApp()
+  const navigate = useNavigate()
   const damStore = useDamStore()
   const pointStore = usePointStore()
+  const chains = usePointChains()
   const observationTable = useIdbTable<ObservationRow>(db.observations)
 
   const [pointForm] = Form.useForm<PointDraft>()
@@ -69,27 +73,32 @@ export default function PointConfig() {
     })
   }
 
-  /** 各测点最新的累计变化量（用于越限统计） */
+  /** 各测点最新的连续累计变化量（沿接续链，用于越限统计） */
   const latestCumulative = useMemo(() => {
     const map: Record<string, number> = {}
-    observationTable.rows.forEach((row) => {
-      const existing = map[row.pointId]
-      if (existing === undefined) {
-        map[row.pointId] = row.cumulative
-      }
-    })
-    observationTable.rows.forEach((row) => {
-      const latest = observationTable.rows
-        .filter((item) => item.pointId === row.pointId)
-        .sort((a, b) => b.date.localeCompare(a.date))[0]
-      if (latest) map[row.pointId] = latest.cumulative
+    chains.headIds.forEach((headId) => {
+      const latest = chains.summaryOf(headId).latest
+      if (latest) map[latest.pointId] = latest.cumulative
+      // 链上非最新测点也回填各自最后一条，便于单点视角展示
+      chains.pointsOf(headId).forEach((point) => {
+        if (map[point.id] === undefined) {
+          const own = observationTable.rows
+            .filter((row) => row.pointId === point.id)
+            .sort((a, b) => b.date.localeCompare(a.date))[0]
+          if (own) map[point.id] = own.cumulative
+        }
+      })
     })
     return map
-  }, [observationTable.rows])
+  }, [chains, observationTable.rows])
 
-  const exceededCount = pointStore.points.filter((point) =>
-    isExceeded(latestCumulative[point.id] ?? 0, point.threshold)
-  ).length
+  const exceededCount = chains.headIds.filter((headId) => {
+    const summary = chains.summaryOf(headId)
+    if (!summary.latest) return false
+    const activePoint =
+      chains.pointsOf(headId).find((point) => point.id === summary.latest?.pointId) ?? chains.pointsOf(headId).slice(-1)[0]
+    return activePoint ? isExceeded(summary.latest.cumulative, activePoint.threshold) : false
+  }).length
 
   const rows = pointStore.points.filter((point) => {
     if (filter.damId && point.damId !== filter.damId) return false
@@ -154,8 +163,12 @@ export default function PointConfig() {
   }
 
   const removePoint = async (point: Point): Promise<void> => {
-    await pointStore.removePoint(point.id)
-    message.success('测点及其观测记录已删除')
+    try {
+      await pointStore.removePoint(point.id)
+      message.success('测点及其观测记录已删除')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除失败')
+    }
   }
 
   const openBulk = (): void => {
@@ -275,20 +288,49 @@ export default function PointConfig() {
       }
     },
     {
+      title: '接续关系',
+      width: 200,
+      render: (_value, record) => {
+        const incoming = chains.incomingLink(record.id)
+        const outgoing = chains.outgoingLink(record.id)
+        if (!incoming && !outgoing) return <span className="muted">单点链</span>
+        const prev = incoming ? pointStore.points.find((point) => point.id === incoming.predecessorId) : null
+        const next = outgoing ? pointStore.points.find((point) => point.id === outgoing.successorId) : null
+        return (
+          <Space size={4} wrap>
+            {incoming ? <Tag color="blue">接替自 {prev ? prev.code : '—'}（{incoming.effectiveDate}）</Tag> : null}
+            {outgoing ? <Tag>由 {next ? next.code : '—'} 接替</Tag> : null}
+          </Space>
+        )
+      }
+    },
+    {
       title: '操作',
-      width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="link" size="small" onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm title="删除该测点将同时删除其观测记录与预警单" onConfirm={() => removePoint(record)}>
-            <Button type="link" size="small" danger>
-              删除
+      width: 210,
+      render: (_value, record) => {
+        const inActiveChain = Boolean(chains.incomingLink(record.id) || chains.outgoingLink(record.id))
+        return (
+          <Space size={4}>
+            <Button type="link" size="small" onClick={() => openEdit(record)}>
+              编辑
             </Button>
-          </Popconfirm>
-        </Space>
-      )
+            {!chains.outgoingLink(record.id) ? (
+              <Button type="link" size="small" onClick={() => navigate(`/successions?from=${record.id}`)}>
+                接替
+              </Button>
+            ) : null}
+            <Popconfirm
+              title={inActiveChain ? '测点在生效接替链中，请先撤下接替关系' : '删除该测点将同时删除其观测记录与预警单'}
+              onConfirm={() => removePoint(record)}
+              disabled={inActiveChain}
+            >
+              <Button type="link" size="small" danger disabled={inActiveChain}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        )
+      }
     }
   ]
 
